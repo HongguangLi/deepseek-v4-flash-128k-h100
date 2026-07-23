@@ -60,37 +60,138 @@ CP>1 的 recipe 自动携带 DSv4 CP 硬性要求（Megatron-LM [#5087](https://
 5. 编辑 `scripts/env_roce.sh`：`NCCL_SOCKET_IFNAME` / `NCCL_IB_HCA` 填集群真实值。
 6. 各 slurm 脚本头部的 `#SBATCH --account/--partition` 与 `CONTAINER_IMAGE` 改成集群实际值。
 
-## Quickstart（按序执行，不可跳级）
+## 执行顺序（严格按 0→8 执行，前一步不通过不进下一步）
+
+先做一次性配置（只做一次）：
+
+1. 每个 `scripts/slurm_*.sh` 头部：改 `#SBATCH --account` / `--partition`；
+2. `scripts/env_roce.sh`：填 `NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA` 集群真实值；
+3. 准备好三个路径并在下面所有命令前 export：
 
 ```bash
-# 0. 软件栈校验（容器内）
-srun -N1 --container-image=$IMG --container-mounts=$MOUNTS \
-    bash $REPO_DIR/scripts/check_stack.sh
-
-# 1. 第一级验收: 网络（1/2/4/16 节点各一次）
-for n in 1 2 4 16; do sbatch -N $n scripts/nccl_level1.sh; done
-
-# 2. 第二级验收: 在固定软件栈上重跑上游 DSv4 CP 测试（单节点容器内）
-#    tests/unit_tests/transformer/experimental_attention_variant/
-#      test_dsv4_hybrid_attention_cp.py  test_csa_cp_utils.py
-#      test_csa_cp_layout_kernels.py     test_dsv4_hybrid_native_parity.py
-#    tests/unit_tests/test_sequence_packing.py
-
-# 3. Phase 0: 权重导入（一次性, 2 节点, TP1/PP1/EP16 官方验证拓扑）
-sbatch scripts/slurm_import.sh
-
-# 4. 阶段 A: 4K 保底冒烟（16 节点, 50 iter）
-REPO_DIR=/workspace/harvey1477 sbatch scripts/slurm_stage_a_4k.sh
-
-# 5. 第三级验收: 显存阶梯（每档 20 iter, 依次通过）
-STEP=32k  REPO_DIR=... DATASET_ROOT=/data/longctx sbatch scripts/slurm_stage_b_128k.sh
-STEP=64k  REPO_DIR=... DATASET_ROOT=/data/longctx sbatch scripts/slurm_stage_b_128k.sh
-STEP=128k REPO_DIR=... DATASET_ROOT=/data/longctx sbatch scripts/slurm_stage_b_128k.sh
-
-# 6. 第四级验收 + 长跑: 1 → 10 → 100 → 1000 iter → save/restart 连续性
-STEP=128k TRAIN_ITERS=1000 SAVE_CKPT=1 REPO_DIR=... DATASET_ROOT=... \
-    sbatch scripts/slurm_stage_b_128k.sh
+export CONTAINER_IMAGE=/path/to/nemo_fw.sqsh          # 含 DSv4 依赖的容器
+export CONTAINER_MOUNTS=/lustre:/lustre               # 必须盖住下面三个目录
+export REPO_DIR=/lustre/harvey1477                    # 本仓库(共享存储上的 clone)
+export WORKSPACE=/lustre/dsv4                         # 结果/模型目录
+export DATASET_ROOT=/lustre/data/longctx_jsonl        # 客户长上下文 JSONL 数据
 ```
+
+### Step 0 — 软件栈校验（1 节点，几分钟）
+
+```bash
+srun -N1 --container-image=$CONTAINER_IMAGE --container-mounts=$CONTAINER_MOUNTS \
+    bash -lc "cd /opt/Megatron-Bridge && ./scripts/switch_mcore.sh dev && uv sync && bash $REPO_DIR/scripts/check_stack.sh"
+```
+
+**通过**：输出 `PASS`（mcore = `bfa33263…`、`csa_cp_utils` 可导入、`fast_hadamard_transform` 在位）。
+**失败**：容器不含 DSv4 依赖 → 换 NeMo FW 容器或按官方 `docker/Dockerfile.ci` 自建，不要带病继续。
+
+### Step 1 — recipe 干跑（1 节点，不花 GPU 时）
+
+对 5 个 recipe 逐个做 `--dryrun`，验证 config 构建、pipeline layout、字段名在你的容器版本上全部成立：
+
+```bash
+srun -N1 --container-image=$CONTAINER_IMAGE --container-mounts=$CONTAINER_MOUNTS \
+    bash -lc "cd /opt/Megatron-Bridge && for r in \
+      dsv4_flash_sft_h100_128gpu_4k_baseline_config \
+      dsv4_flash_sft_h100_128gpu_32k_cp4_config \
+      dsv4_flash_sft_h100_128gpu_64k_cp8_config \
+      dsv4_flash_sft_h100_128gpu_128k_cp16_config \
+      dsv4_flash_sft_h100_128gpu_128k_cp32_fallback_config; do \
+        echo \"== \$r ==\"; \
+        uv run --no-sync python $REPO_DIR/scripts/run_dsv4_recipe.py \
+            --recipe \$r --step_func gpt_step --dataset mock --dryrun; \
+    done"
+```
+
+**通过**：5 个全部构建成功。**失败**：报错会指明字段名/layout 问题，先修 recipe 再往下走。
+
+### Step 2 — 第一级验收：网络（1/2/4/16 节点各一次）
+
+```bash
+for n in 1 2 4 16; do sbatch -N $n scripts/nccl_level1.sh; done
+```
+
+**通过**：每项 `#wrong=0`；无 WARN/timeout；日志显示 `NET/IB` 而非 `NET/Socket`；各节点带宽无离群。
+**失败**：交给网络团队，训练不要开始。
+
+### Step 3 — 第二级验收：DSv4 CP 正确性（1 节点 8 GPU）
+
+在固定软件栈上原样重跑上游 #5087 的测试：
+
+```bash
+srun -N1 --gpus-per-node=8 --container-image=$CONTAINER_IMAGE --container-mounts=$CONTAINER_MOUNTS \
+    bash -lc "cd /opt/Megatron-Bridge/3rdparty/Megatron-LM && \
+      uv run --no-sync torchrun --nproc_per_node=8 -m pytest -x -q \
+        tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp.py \
+        tests/unit_tests/transformer/experimental_attention_variant/test_csa_cp_utils.py \
+        tests/unit_tests/transformer/experimental_attention_variant/test_csa_cp_layout_kernels.py \
+        tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_native_parity.py \
+        tests/unit_tests/test_sequence_packing.py"
+```
+
+（分布式测试的具体调起方式以 Megatron-LM `tests/` 内约定为准；个别用例需要特定 world size 时按其 skip 条件拆开跑。）
+**通过**：全绿。**失败**：说明你们的容器栈与上游 CI 有差异，升级 Solution Team，**不要**启动 128K。
+
+### Step 4 — Phase 0：权重导入（2 节点，一次性）
+
+```bash
+sbatch scripts/slurm_import.sh
+```
+
+**通过**：`$WORKSPACE/models/DeepSeek-V4-Flash/iter_0000000/.metadata` 存在（~570GB bf16）。
+重复提交会自动跳过。
+
+### Step 5 — 阶段 A：4K 保底冒烟（16 节点，50 iter，约 1-2 小时）
+
+```bash
+sbatch scripts/slurm_stage_a_4k.sh
+```
+
+**通过**：loss 有限且下降、无 NaN、NCCL 无 WARN/Socket 回退。
+这一步验证的是权重导入/软件栈/16 节点 RoCE/PP·EP 拓扑——与长上下文无关的一切。
+**失败**：问题一定不在 CP/128K，在基础栈里；修好前不进 Step 6。
+
+### Step 6 — 第三级验收：显存阶梯（16 节点，每档 20 iter，依次通过）
+
+```bash
+STEP=32k  sbatch scripts/slurm_stage_b_128k.sh
+STEP=64k  sbatch scripts/slurm_stage_b_128k.sh
+STEP=128k sbatch scripts/slurm_stage_b_128k.sh
+```
+
+**每档通过标准**：完成 fwd/bwd/optimizer step；无 OOM/NaN/Inf；128K 档另加：
+每卡 `max_memory_allocated ≤ 72 GiB`、reserved 不持续增长、所有 rank 本地序列 ≈ 8192、
+日志确认 THD + contiguous CP 切分生效。
+**128K 档超 72GiB**：先在该 recipe 上叠 full recompute
+（追加 `model.recompute_granularity=full model.recompute_method=uniform model.recompute_num_layers=1`）；
+仍超 → `STEP=cp32`；再不行 → 停，回阶段 A 并升级 Solution Team。
+
+### Step 7 — 第四级验收：稳定性（16 节点）
+
+同一配置按 1 → 10 → 100 → 1000 iter 递增：
+
+```bash
+STEP=128k TRAIN_ITERS=1    sbatch scripts/slurm_stage_b_128k.sh
+STEP=128k TRAIN_ITERS=10   sbatch scripts/slurm_stage_b_128k.sh
+STEP=128k TRAIN_ITERS=100  sbatch scripts/slurm_stage_b_128k.sh
+STEP=128k TRAIN_ITERS=1000 SAVE_CKPT=1 sbatch scripts/slurm_stage_b_128k.sh
+```
+
+1000-iter 跑完后做 save→restart→load 连续性验证（加载上一步保存的 checkpoint 再跑 100 iter）：
+
+```bash
+STEP=128k TRAIN_ITERS=1100 SAVE_CKPT=1 sbatch scripts/slurm_stage_b_128k.sh
+# 并在提交前把上一次的 checkpoint 目录传给 checkpoint.load（编辑脚本 SAVE_OVERRIDES 或加 CLI 覆盖）
+```
+
+**通过**：loss/grad norm 有限；无 iter-2 NaN；恢复后 loss 轨迹连续；峰值显存预留 ≥ 8 GiB；
+RoCE 无重传风暴/NCCL timeout/rank stall。
+
+### Step 8 — 正式长跑
+
+Step 7 全部通过后，把 `TRAIN_ITERS`、lr/warmup、`SAVE_INTERVAL` 调成正式训练值，
+继续用 `STEP=128k SAVE_CKPT=1` 提交。至此才可以对客户说这套配置是经过验证的。
 
 ## 验收标准（摘要，详见方案文档）
 
