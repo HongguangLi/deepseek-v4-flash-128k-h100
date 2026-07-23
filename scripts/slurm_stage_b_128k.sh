@@ -55,9 +55,14 @@ fi
 # ---- 运行参数 ----
 TRAIN_ITERS=${TRAIN_ITERS:-20}       # 阶梯冒烟默认 20 iter; 稳定性阶段调到 1000
 LR=${LR:-5e-6}
+LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-10}   # 正式长跑按总步数调大(如 100-500)
+GBS=${GBS:-}                         # 留空 = 用 recipe 默认; 正式长跑建议 8-32(DP=1 时即梯度累积)
 SAVE_CKPT=${SAVE_CKPT:-0}            # 长跑时置 1(每个 checkpoint ~570GB, 只保留最新)
 SAVE_INTERVAL=${SAVE_INTERVAL:-300}
 LOG_INTERVAL=1
+# RUN_NAME 决定 checkpoint 目录。正式长跑必须显式固定(如 dsv4_flash_128k_prod),
+# 这样重提交同一命令会从最新 checkpoint 自动续跑; 冒烟默认按 job id 隔离。
+RUN_NAME=${RUN_NAME:-dsv4_flash_${STEP}_${SLURM_JOB_ID:-manual}}
 
 CONTAINER_IMAGE=${CONTAINER_IMAGE:?set CONTAINER_IMAGE to your .sqsh}
 CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-}
@@ -74,12 +79,17 @@ SRUN_CMD="srun --mpi=pmix --container-image=$CONTAINER_IMAGE"
 DATASET_ARGS="--dataset $DATASET"
 [ -n "$DATASET_ROOT" ] && DATASET_ARGS="$DATASET_ARGS dataset.dataset_root=$DATASET_ROOT"
 
-RUN_NAME=dsv4_flash_${STEP}_${SLURM_JOB_ID:-manual}
+CHECKPOINT_DIR=${WORKSPACE}/results/${RUN_NAME}/checkpoints
 if [ "$SAVE_CKPT" = "1" ]; then
-    SAVE_OVERRIDES="checkpoint.save=${WORKSPACE}/results/${RUN_NAME}/checkpoints checkpoint.save_interval=$SAVE_INTERVAL checkpoint.most_recent_k=1"
+    # save 与 load 指向同一目录: 目录里有 checkpoint 就自动续跑,
+    # 没有则从 checkpoint.pretrained_checkpoint(bf16 导入产物)冷启动。
+    SAVE_OVERRIDES="checkpoint.save=$CHECKPOINT_DIR checkpoint.load=$CHECKPOINT_DIR checkpoint.save_interval=$SAVE_INTERVAL checkpoint.most_recent_k=1"
 else
     SAVE_OVERRIDES="checkpoint.save=null checkpoint.load=null"
 fi
+
+GBS_OVERRIDE=""
+[ -n "$GBS" ] && GBS_OVERRIDE="train.global_batch_size=$GBS"
 
 echo "=== DSv4-Flash Stage B: STEP=$STEP recipe=$RECIPE_NAME iters=$TRAIN_ITERS ==="
 
@@ -96,8 +106,9 @@ $SRUN_CMD bash -lc "
         $DATASET_ARGS \
         dataset.enable_offline_packing=true \
         train.train_iters=$TRAIN_ITERS \
+        $GBS_OVERRIDE \
         optimizer.lr=$LR \
-        scheduler.lr_warmup_iters=10 \
+        scheduler.lr_warmup_iters=$LR_WARMUP_ITERS \
         scheduler.lr_decay_iters=$TRAIN_ITERS \
         validation.eval_iters=2 \
         dataset.do_test=false \

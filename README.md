@@ -195,23 +195,43 @@ STEP=128k sbatch scripts/slurm_stage_b_128k.sh
 STEP=128k TRAIN_ITERS=1    sbatch scripts/slurm_stage_b_128k.sh
 STEP=128k TRAIN_ITERS=10   sbatch scripts/slurm_stage_b_128k.sh
 STEP=128k TRAIN_ITERS=100  sbatch scripts/slurm_stage_b_128k.sh
-STEP=128k TRAIN_ITERS=1000 SAVE_CKPT=1 sbatch scripts/slurm_stage_b_128k.sh
+STEP=128k TRAIN_ITERS=1000 SAVE_CKPT=1 RUN_NAME=dsv4_128k_stab sbatch scripts/slurm_stage_b_128k.sh
 ```
 
-1000-iter 跑完后做 save→restart→load 连续性验证（加载上一步保存的 checkpoint 再跑 100 iter）：
+1000-iter 跑完后做 save→restart→load 连续性验证：**用同一个 `RUN_NAME` 重提交**、把
+`TRAIN_ITERS` 加 100，脚本会自动从该目录的最新 checkpoint 续跑（`checkpoint.save` 与
+`checkpoint.load` 指向同一目录）：
 
 ```bash
-STEP=128k TRAIN_ITERS=1100 SAVE_CKPT=1 sbatch scripts/slurm_stage_b_128k.sh
-# 并在提交前把上一次的 checkpoint 目录传给 checkpoint.load（编辑脚本 SAVE_OVERRIDES 或加 CLI 覆盖）
+STEP=128k TRAIN_ITERS=1100 SAVE_CKPT=1 RUN_NAME=dsv4_128k_stab sbatch scripts/slurm_stage_b_128k.sh
 ```
 
-**通过**：loss/grad norm 有限；无 iter-2 NaN；恢复后 loss 轨迹连续；峰值显存预留 ≥ 8 GiB；
-RoCE 无重传风暴/NCCL timeout/rank stall。
+**通过**：loss/grad norm 有限；无 iter-2 NaN；恢复后 loss 轨迹连续（对比 restart 前后
+log 的 loss 曲线无跳变）；峰值显存预留 ≥ 8 GiB；RoCE 无重传风暴/NCCL timeout/rank stall。
 
-### Step 8 — 正式长跑
+### Step 8 — 正式长跑（16 节点）
 
-Step 7 全部通过后，把 `TRAIN_ITERS`、lr/warmup、`SAVE_INTERVAL` 调成正式训练值，
-继续用 `STEP=128k SAVE_CKPT=1` 提交。至此才可以对客户说这套配置是经过验证的。
+Step 7 全部通过后提交正式训练。与阶梯冒烟的区别只有四个参数：固定的 `RUN_NAME`
+（决定 checkpoint 目录，续跑靠它）、正式的 `TRAIN_ITERS`/`LR_WARMUP_ITERS`、
+提高的 `GBS`（DP=1 下即梯度累积步数，吞吐换显存无代价，建议 8–32）：
+
+```bash
+STEP=128k \
+RUN_NAME=dsv4_flash_128k_prod \
+SAVE_CKPT=1 SAVE_INTERVAL=250 \
+TRAIN_ITERS=5000 LR=5e-6 LR_WARMUP_ITERS=100 GBS=16 \
+DATASET_ROOT=/lustre/data/longctx_jsonl \
+sbatch scripts/slurm_stage_b_128k.sh
+```
+
+（`TRAIN_ITERS`/`LR`/`GBS` 按客户数据量与训练目标定，上面是示例值；
+`SAVE_INTERVAL=250` 即约每 250 iter 存一次，`most_recent_k=1` 只保留最新一份 ~570GB。）
+
+- **断点续跑 / 追加训练**：原样重提交同一条命令即可（同 `RUN_NAME` 自动从最新 checkpoint
+  恢复）；要多训一段就只改大 `TRAIN_ITERS`。
+- **时限接力**：集群单作业时限不够时，用同名作业串行排队：
+  `sbatch --job-name=dsv4prod --dependency=singleton ...` 连提多次，每段自动续上一段。
+- 至此才可以对客户说这套配置是经过验证的。
 
 ## 验收标准（汇总）
 
