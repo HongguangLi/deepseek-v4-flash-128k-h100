@@ -71,7 +71,7 @@ CP>1 的 recipe 自动携带 DSv4 CP 硬性要求（Megatron-LM [#5087](https://
 ```bash
 export CONTAINER_IMAGE=/path/to/nemo_fw.sqsh          # 含 DSv4 依赖的容器
 export CONTAINER_MOUNTS=/lustre:/lustre               # 必须盖住下面三个目录
-export REPO_DIR=/lustre/harvey1477                    # 本仓库(共享存储上的 clone)
+export REPO_DIR=/lustre/deepseek-v4-flash-128k-h100   # 本仓库(共享存储上的 clone)
 export WORKSPACE=/lustre/dsv4                         # 结果/模型目录
 export DATASET_ROOT=/lustre/data/longctx_jsonl        # 客户长上下文 JSONL 数据
 ```

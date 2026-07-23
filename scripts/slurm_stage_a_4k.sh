@@ -24,7 +24,7 @@ mkdir -p logs
 
 # ---- 路径 ----
 WORKSPACE=${WORKSPACE:-/workspace}
-REPO_DIR=${REPO_DIR:?本仓库在容器内的挂载路径, 例如 /workspace/harvey1477}
+REPO_DIR=${REPO_DIR:?本仓库在容器内的挂载路径, 例如 /workspace/deepseek-v4-flash-128k-h100}
 MODEL_VARIANT=${MODEL_VARIANT:-DeepSeek-V4-Flash}
 MEGATRON_DIR=${MEGATRON_DIR:-${WORKSPACE}/models/${MODEL_VARIANT}}
 PRETRAINED_CKPT="${MEGATRON_DIR}/iter_0000000"   # scripts/slurm_import.sh 的产物
