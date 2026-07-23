@@ -1,22 +1,6 @@
-# DeepSeek-V4-Flash 128K · 16×8 H100 · RoCE 训练方案（v2）
+# DeepSeek-V4-Flash 128K · 16×8 H100 · RoCE 训练方案
 
-> v2 更新日期：2026-07-23。本版已逐条对照 [NVIDIA-NeMo/Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) `main` 分支与 Megatron-LM 上游代码核实，修正了 v1 中与仓库不符的全部配置项。v1 的核心前提已过时：**DSv4 的 Context Parallel 支持已于 2026-07-03 合入上游**（见下文）。
-
-## 0. 与 v1 的关键差异（必读）
-
-| 项目 | v1（旧） | v2（已核实） |
-|---|---|---|
-| DSv4 CP 支持 | "distributed test 失败、to be done" | 已合入：THD 打包 [Megatron-LM #5011](https://github.com/NVIDIA/Megatron-LM/pull/5011)（2026-06-26 merged）、CP [Megatron-LM #5087](https://github.com/NVIDIA/Megatron-LM/pull/5087)（2026-07-03 merged） |
-| CP 通信方式 | `cp_comm_type="a2a+p2p"` + `hierarchical_context_parallel_sizes=[8,2]` | **不适用于 DSv4**。DSv4 hybrid attention 的 CP 走专用路径：THD（packed）输入 + `cp_partition_mode="contiguous"` + `sequence_packing_scheduler`，不是普通 attention 的 ring/hierarchical CP |
-| 数据格式 | 未提（隐含 SBHD） | **CP>1 时强制 THD**：上游校验 `DSv4 Hybrid with CP requires qkv_format='thd'`，且 `cp_partition_mode` 必须为 `contiguous` |
-| rope fusion | `apply_rope_fusion=False` | **保持 True**（官方 recipe 默认值；历史 NaN 是 `rotary_percent` 映射 bug，已在 Bridge #4271 修复） |
-| 重计算 | 一律 full/uniform | 先用官方 recipe 的 selective（`["moe_act","mhc"]`）+ CP 切分，OOM 再升级 full |
-| MTP 关闭方式 | `num_mtp_predictor=0`（**字段不存在**） | 直接用官方 recipe `deepseek_v4_flash_no_mtp_sft_config`（内部处理 `mtp_num_layers=None` 并裁剪 `csa_compress_ratios`） |
-| 分布式优化器 | `cfg.optimizer.use_distributed_optimizer` | Bridge 中在 `cfg.ddp.use_distributed_optimizer`（SFT recipe 已默认 Adam/bf16 + dist-opt 路线） |
-| 入口 | `examples/models/deepseek_v4/<entry>.py` | `scripts/training/run_recipe.py --recipe <name>`（参考 `examples/models/deepseek_v4/slurm_sft.sh` / `slurm_pretrain.sh`） |
-| 版本固定 | 仅"记录 commit" | 有明确机制：`./scripts/switch_mcore.sh dev`。Bridge `main` 的 `.dev.commit` = `bfa33263ca06e6974410d0ea871b25e21c5aee85`，**恰好就是 #5087（DSv4 CP）的 merge commit** |
-
-官方 README（examples/models/deepseek_v4/README.md）中 "Context parallel / long-context (≥64K): TODO" 的表格是 2026-06-02 核实的，已滞后于上述两个 PR 的合入；以代码和 `.dev.commit` 为准。
+> 2026-07-23 逐条对照 [NVIDIA-NeMo/Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) `main` 分支与 Megatron-LM 上游代码核实。注意：官方 README（examples/models/deepseek_v4/README.md）中 "Context parallel / long-context (≥64K): TODO" 是 2026-06-02 的旧状态——THD 打包（[Megatron-LM #5011](https://github.com/NVIDIA/Megatron-LM/pull/5011)，2026-06-26 merged）与 DSv4 Context Parallel（[Megatron-LM #5087](https://github.com/NVIDIA/Megatron-LM/pull/5087)，2026-07-03 merged）均已合入，以代码和 `.dev.commit` 为准。
 
 ## 1. 结论：两阶段菜单
 
