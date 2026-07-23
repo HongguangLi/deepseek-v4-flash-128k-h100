@@ -13,7 +13,7 @@
 | GPU | 128 × H100 80GB（16 节点 × 8） |
 | Recipe | `deepseek_v4_flash_no_mtp_sft_config`（或需要 MTP 时 `deepseek_v4_flash_sft_config`） |
 | TP / PP / EP / CP | 1 / 4 / 8 / 1 |
-| DP | 4（128 ÷ (PP4·CP1)）— fp32 master 可分片，规避 32 卡 DP=1 的 OOM |
+| DP | 32（128 ÷ (PP4·CP1)）— fp32 master 可分片，规避 32 卡 DP=1 的 OOM |
 | 序列长度 | 4096（recipe 默认），SBHD、不打包 |
 | 精度 / 优化器 | bf16 / Adam（**不要**用 MXFP8 或 Muon 做 SFT：官方确认 iter-2 分别 NaN / assert） |
 | mHC | `use_fused_mhc` 由 recipe 自动判定（H100 上自动为 False，无需手动设置） |
