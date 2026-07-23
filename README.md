@@ -6,13 +6,33 @@
 128×H100、128K 上下文（CP16 + THD）的 recipe 与 Slurm 启动脚本，全部复用官方入口
 （`run_recipe.py` / `run_conversion.py`），不修改 Megatron-Bridge 源码。
 
-完整方案与论证见 [deepseek_v4_flash_128k_h100_roce_plan.md](deepseek_v4_flash_128k_h100_roce_plan.md)。
+> 2026-07-23 逐条对照 Megatron-Bridge `main` 与 Megatron-LM 上游代码核实。官方 README 中
+> "Context parallel / long-context (≥64K): TODO" 是 2026-06-02 的旧状态——THD 打包
+> （[#5011](https://github.com/NVIDIA/Megatron-LM/pull/5011)，2026-06-26 merged）与 DSv4
+> Context Parallel（[#5087](https://github.com/NVIDIA/Megatron-LM/pull/5087)，2026-07-03
+> merged）均已合入，以代码和 `.dev.commit` 为准。
+
+## 方案结论：两阶段
+
+"100% 可行"只能建立在官方已验证的路径上。当前官方**已端到端验证**的 DSv4-Flash 全参训练
+是 4K / SBHD / bf16+Adam / TP1·PP4·EP8·CP1（H100 需 ≥64 卡使 fp32 master 权重可分片）。
+128K + CP16 的代码支持已合入并带上游测试，但没有公开记录在 128×H100 规模上跑通过。因此：
+
+- **阶段 A（保底，可称 100% 可行）**：4K 基线 = 官方验证配置在 128 卡上的直接放大（DP=32），
+  用于验证权重导入、软件栈、RoCE、拓扑——与长上下文无关的一切。
+- **阶段 B（目标）**：128K / TP1·PP8·CP16·EP8 / THD+contiguous，每卡本地序列 8192 tokens，
+  分布式优化器在 DP×CP=16 上分片 master 权重。必须通过下文 Step 2/3/6/7 的
+  网络、数值、显存、稳定性四级验收后才可长跑——"可行"由验收证明，不由静态配置保证。
+
+DSv4 CP 的三个硬性要求（与普通 attention 的 ring/hierarchical CP 完全不同，
+`cp_comm_type=a2a+p2p` 之类的配置不适用）：THD（packed）输入、
+`cp_partition_mode="contiguous"`、非空 `sequence_packing_scheduler`。
+本仓库 recipe 已内置，无需手工设置。
 
 ## 仓库结构
 
 ```text
-├── README.md                                  本文件
-├── deepseek_v4_flash_128k_h100_roce_plan.md   方案文档（菜单、验收标准、降级路径）
+├── README.md                                  本文件（方案 + 运行手册）
 ├── recipes/
 │   └── dsv4_flash_h100_128gpu.py              5 个 recipe（见下表），派生自官方 no_mtp SFT recipe
 └── scripts/
@@ -193,7 +213,7 @@ RoCE 无重传风暴/NCCL timeout/rank stall。
 Step 7 全部通过后，把 `TRAIN_ITERS`、lr/warmup、`SAVE_INTERVAL` 调成正式训练值，
 继续用 `STEP=128k SAVE_CKPT=1` 提交。至此才可以对客户说这套配置是经过验证的。
 
-## 验收标准（摘要，详见方案文档）
+## 验收标准（汇总）
 
 - **网络**：`#wrong=0`、无 WARN/timeout、日志 `NET/IB` 而非 `NET/Socket`。
 - **128K 显存**：每卡 `max_memory_allocated ≤ 72 GiB`，reserved 不持续增长，所有 rank 本地序列 ≈ 8192。
@@ -207,3 +227,15 @@ Step 7 全部通过后，把 `TRAIN_ITERS`、lr/warmup、`SAVE_INTERVAL` 调成�
 - 全参训练必须从 bf16 导入产物启动，不能直接用 FP8/MXFP4 推理量化权重。
 - 不存 optimizer state（脚本已固定 `save_optim=false`）；每个模型 checkpoint ~570GB。
 - H100 上 `use_fused_mhc` 由 recipe 自动置 False（fused mHC 为 sm_100 专用）。
+- 混合长度 SFT 数据可选 Dynamic CP（官方示例 `examples/training_features/long_context/`）；
+  全部样本都接近 128K 时首选本仓库的静态 CP=16。
+
+## 参考来源
+
+- [Megatron-Bridge · examples/models/deepseek_v4（README / slurm_sft.sh / slurm_pretrain.sh / conversion.sh）](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/deepseek_v4)
+- [Megatron-Bridge · src/megatron/bridge/recipes/deepseek/h100/deepseek_v4.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/src/megatron/bridge/recipes/deepseek/h100/deepseek_v4.py)
+- [Megatron-Bridge · examples/training_features/long_context/](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/training_features/long_context)
+- [Megatron-LM PR #5011 — Packed Sequence (THD) support for DSv4 Hybrid Attention（2026-06-26 merged）](https://github.com/NVIDIA/Megatron-LM/pull/5011)
+- [Megatron-LM PR #5087 — DSv4 Context Parallel support（2026-07-03 merged）](https://github.com/NVIDIA/Megatron-LM/pull/5087)
+- [Megatron-LM issue #4468 — DSv4 capability tracking](https://github.com/NVIDIA/Megatron-LM/issues/4468)
+- [context_parallel package — Megatron Core docs](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/context_parallel.html)
