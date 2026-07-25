@@ -91,6 +91,10 @@ fi
 GBS_OVERRIDE=""
 [ -n "$GBS" ] && GBS_OVERRIDE="train.global_batch_size=$GBS"
 
+# 任意附加 CLI 覆盖(空格分隔), 用于性能调优, 例如:
+#   EXTRA_OVERRIDES="model.apply_dsa_kernel_fusion=true"
+EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
+
 echo "=== DSv4-Flash Stage B: STEP=$STEP recipe=$RECIPE_NAME iters=$TRAIN_ITERS ==="
 
 $SRUN_CMD bash -lc "
@@ -115,7 +119,8 @@ $SRUN_CMD bash -lc "
         checkpoint.pretrained_checkpoint=$PRETRAINED_CKPT \
         checkpoint.load_optim=false \
         $SAVE_OVERRIDES \
-        logger.log_interval=$LOG_INTERVAL
+        logger.log_interval=$LOG_INTERVAL \
+        $EXTRA_OVERRIDES
 "
 
 echo "=== Stage B ($STEP) 完成。检查每卡峰值显存(<=72GiB)、无 NaN、CP 切分日志 ==="

@@ -240,6 +240,86 @@ sbatch scripts/slurm_stage_b_128k.sh
 - **稳定性**：loss/grad norm 有限、无 iter-2 NaN、checkpoint 恢复后 loss 连续、峰值预留 ≥ 8 GiB。
 - **降级顺序**：selective→full recompute → `STEP=cp32` → 仍失败则停止 128K 长跑，回阶段 A 并升级 Solution Team。
 
+## 性能调优（"能跑但 128K 奇慢"时按序执行）
+
+先量化再调优：记录当前每 iter 耗时与 `tokens/s/GPU`（= GBS×131072 ÷ iter 时间 ÷ 128），
+每改一项只改一项，对比数字。常见的"奇慢"根因按收益排序：
+
+### 1. GBS 太小 → 流水线气泡吃掉大部分算力（最常见，零成本）
+
+流水线气泡占比 ≈ (PP−1)/(m+PP−1)，m = 梯度累积步数 = GBS（DP=1 时）。
+
+| 配置 | GBS=1 | GBS=8 | GBS=16 | GBS=32 |
+|---|---:|---:|---:|---:|
+| PP4（cp32 档） | **75% 空转** | 27% | 16% | 9% |
+| PP8（cp16 档） | **87.5% 空转** | 47% | 30% | 18% |
+
+冒烟脚本默认 GBS=1 只用于验证能跑；测速/长跑必须提高：
+
+```bash
+STEP=cp32 GBS=16 TRAIN_ITERS=20 sbatch scripts/slurm_stage_b_128k.sh
+```
+
+GBS 是梯度累积，不增加显存，只改变优化步的等效 batch（lr/warmup 相应调整）。
+
+### 2. CP32 是显存保底档，不是性能档 → 尽量回 CP16
+
+CP32：每卡本地序列仅 4096（计算/通信比差）、CP 组横跨 4 节点全走 RoCE、
+还叠了 full recompute（多算约 1/3）。若 CP16 档能过 72GiB 验收，回
+`STEP=128k`（CP16/PP8：本地 8192、CP 组只跨 2 节点、selective recompute）。
+若 CP16 差一点点显存，先试 CP16 + full recompute（比 CP32+full 仍快）：
+
+```bash
+STEP=128k GBS=16 EXTRA_OVERRIDES="model.recompute_granularity=full model.recompute_method=uniform model.recompute_num_layers=1 model.recompute_modules=null" sbatch scripts/slurm_stage_b_128k.sh
+```
+
+### 3. 打开 H100 的 fused DSA kernel（上游 #5087 新放开）
+
+官方 recipe `apply_dsa_kernel_fusion=False` 是 SM100-only 时代的老默认；
+[#5087](https://github.com/NVIDIA/Megatron-LM/pull/5087) 已将 fused DSA 放开到
+SM90（Hopper）。128K 下 attention/indexer 是计算大头，收益显著。
+前提：容器内 `pip install --no-deps "nvidia-cudnn-frontend[cutedsl]>=1.24.0"`
+（全量安装会遮蔽容器 CUDA）。先 100 iter 与未开启时做 loss 对照再长跑：
+
+```bash
+STEP=128k GBS=16 EXTRA_OVERRIDES="model.apply_dsa_kernel_fusion=true" sbatch scripts/slurm_stage_b_128k.sh
+```
+
+### 4. 通信重叠
+
+```bash
+EXTRA_OVERRIDES="comm_overlap.overlap_moe_expert_parallel_comm=true"
+```
+
+EP all-to-all 与计算重叠；与 ddp 的 `overlap_grad_reduce/overlap_param_gather`
+（Adam recipe 路线默认已开）叠加使用。逐项开、逐项对比。
+
+### 5. 数据是混合长度 → Dynamic CP
+
+静态 CP32 会把 4K 的短样本也切成 32 份跑，纯浪费。若 SFT 数据长短混合，
+改用官方 Dynamic CP（`examples/training_features/long_context/`）：
+
+```bash
+EXTRA_OVERRIDES="model.dynamic_context_parallel=true model.sequence_packing_scheduler=default_dynamic_cp model.max_seqlen_per_dp_cp_rank=8192 model.min_dynamic_context_parallel_size=1"
+```
+
+短样本自动 local_cp_size=1，只有真 128K 样本才占满 CP 组。
+
+### 6. 网络自查
+
+16 节点 `all_gather_perf`/`reduce_scatter_perf` 的 busbw 应接近 RoCE 线速；
+训练日志绝不能出现 `NET/Socket`。带宽差一个量级时先修网络再谈调优。
+
+### 其他说明
+
+- **flashattention / liger 用不了是预期行为**，不是缺陷：DSv4 的 CSA/DSA/SWA/mHC 走
+  TE/cuDNN 专用 kernel（`fast_hadamard_transform`、cuDNN FE、flash-mla），
+  llama-factory 一类通用栈没有这些结构的实现。效率来自并行拓扑 + 上面的 fusion，
+  换框架解决不了，反而失去唯一支持 DSv4 CP 的实现。
+- CUDA Graph 对 DSv4 THD 路径上游仍是 TODO，不要开。
+- 以上都做完仍不达标：抓一次 `nsys` profile（或开 mcore timing log）定位热点，
+  连同 tokens/s 数字升级给 Solution Team / perf 团队。
+
 ## 已知约束（来自官方 README / 上游代码）
 
 - DSv4 要求 **TP=1**（MLA TP 与 hybrid attention 路径不兼容），用 PP/EP/CP 扩展。
