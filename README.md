@@ -277,7 +277,12 @@ GBS 太小（流水线气泡）、CP 档位过保守、full recompute、未开 f
 STEP=cp32 GBS=16 TRAIN_ITERS=20 sbatch scripts/slurm_stage_b_128k.sh
 ```
 
-GBS 是梯度累积，不增加显存，只改变优化步的等效 batch（lr/warmup 相应调整）。
+GBS 是梯度累积，不改变单 microbatch 显存；但注意 **1F1B 下 stage-0 同时持有
+`min(GBS, PP)` 份 microbatch 的激活存根**——full recompute 下每份只是各层输入
+（~百 MB 级），增量约 1–2 GiB，且在 GBS=PP 处封顶（再大只加时间不加显存）。
+显存贴边（峰值距容量 <3 GiB）的配置，先用 **GBS=PP 跑 5-step 探针**确认峰值，
+过了再上 16/32（与 GBS=PP 显存相同）；OOM 则退 GBS=PP/2。
+lr/warmup 按等效 batch 相应调整。
 
 ### 2. CP32 是显存保底档，不是性能档 → 尽量回 CP16
 
