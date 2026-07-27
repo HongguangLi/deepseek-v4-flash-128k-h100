@@ -259,8 +259,23 @@ sbatch scripts/slurm_stage_b_128k.sh
 
 这是工程估算带，不是官方 benchmark（DSv4-Flash 128K on H100 没有公开官方数据）；
 需要背书数字时走 Solution Team。实测远低于带（如个位数 K）几乎总能归因到:
-GBS 太小（流水线气泡）、CP 档位过保守、full recompute、未开 fused DSA、
-或 NCCL 回退 `NET/Socket`——即下面各节，按收益排序：
+GBS 太小（流水线气泡）、full recompute、CP 档位不当、MTP 没关、未开 fused DSA、
+或 NCCL 回退 `NET/Socket`——即下面各节，按收益排序。
+
+**调优纪律**：一次只改一项；每项用 5-step 探针验收；每次记录三个数——
+稳态 iter 时间、TPS、每卡 `max_memory_allocated` 峰值。预测值与实测的偏差本身就是
+诊断信息（如 GBS 提高后 TPS 低于气泡公式预测 → CP 通信占比超预期）。
+
+叠加预期示例（实测案例：32K / CP16 / PP8 / full recompute / GBS=1 起点 3.8K TPS）：
+
+| 叠加项 | 预计 TPS |
+|---|---:|
+| GBS=32（气泡 87.5%→18%） | ~25K |
+| + selective recompute（省 ~1/4 计算） | ~31K |
+| + SM90 fused DSA（×1.3 估） | **~40K** |
+
+这大约是 unfused→fused 过渡期在 CP16 下的天花板；再往上需要更长的 local seq
+（更低 CP 档）+ Dynamic CP，见下文。
 
 ### 1. GBS 太小 → 流水线气泡吃掉大部分算力（最常见，零成本）
 
@@ -284,22 +299,51 @@ GBS 是梯度累积，不改变单 microbatch 显存；但注意 **1F1B 下 stag
 过了再上 16/32（与 GBS=PP 显存相同）；OOM 则退 GBS=PP/2。
 lr/warmup 按等效 batch 相应调整。
 
-### 2. CP32 是显存保底档，不是性能档 → 尽量回 CP16
+### 2. full → selective recompute（省 ~1/4 计算）
 
-CP32：每卡本地序列仅 4096（计算/通信比差）、CP 组横跨 4 节点全走 RoCE、
-还叠了 full recompute（多算约 1/3）。若 CP16 档能过 72GiB 验收，回
-`STEP=128k`（CP16/PP8：本地 8192、CP 组只跨 2 节点、selective recompute）。
-若 CP16 差一点点显存，先试 CP16 + full recompute（比 CP32+full 仍快）：
+full recompute 每步白算一次前向。官方 recipe 的 selective 组合：
+
+```yaml
+recompute_granularity: selective
+recompute_modules: ["moe_act", "mhc"]
+recompute_method: null
+recompute_num_layers: null
+```
+
+selective 每 microbatch 存的激活比 full 多，与 GBS 的在途份数（`min(GBS,PP)`）
+相乘——所以顺序是 **先小 GBS + selective 探针，过了再抬 GBS**。full 只在
+显存验收不过时作为降级手段。
+
+### 3. 关闭 MTP（SFT 不需要）
+
+MTP 层白吃一层的计算、显存和 loss head。用官方 no_mtp 方式关闭
+（`deepseek_v4_flash_no_mtp_sft_config` 的做法：`mtp_num_layers=None` 并把
+`csa_compress_ratios` 裁剪回 `num_layers`），**不要只把 loss 系数置 0**——那样层还在算。
+本仓库 recipes 已默认 no_mtp。
+
+### 4. CP 档位：显存允许时用更低的 CP（更长 local seq）
+
+**红线：还在 unfused DSA/CSA 路径上时，不要为了效率降 CP。** unfused backward 会
+物化随 local seq 增长的大临时张量（实测案例：64K/CP16、local 4096 时单笔申请
+45.86 GiB 直接 OOM）。降 CP = 提 local seq = 撞同一堵墙。先完成第 5 步（fused DSA）
+再回来降 CP。
+
+fused 栈上的原则：local seq 越长计算/通信比越好，CP 组跨的节点越少越好。
+128K 上 CP32 是显存保底档（local 4096、CP 组跨 4 节点、常叠 full recompute），
+显存过验收就回 CP16（`STEP=128k`：local 8192、CP 组只跨 2 节点、selective）。
+若 CP16 差一点点显存，先试 CP16 + full recompute（仍快于 CP32+full）：
 
 ```bash
 STEP=128k GBS=16 EXTRA_OVERRIDES="model.recompute_granularity=full model.recompute_method=uniform model.recompute_num_layers=1 model.recompute_modules=null" sbatch scripts/slurm_stage_b_128k.sh
 ```
 
-### 3. 打开 H100 的 fused DSA kernel（上游 #5087 新放开）
+### 5. 打开 H100 的 fused DSA kernel（上游 #5087 新放开）
 
 官方 recipe `apply_dsa_kernel_fusion=False` 是 SM100-only 时代的老默认；
 [#5087](https://github.com/NVIDIA/Megatron-LM/pull/5087) 已将 fused DSA 放开到
-SM90（Hopper）。128K 下 attention/indexer 是计算大头，收益显著。
+SM90（Hopper）。这一项同时打两个靶：长上下文下 attention/indexer 的计算大头下降，
+且 **unfused backward 物化的大临时张量（45.86 GiB 一类）随之消失**——它既是吞吐项
+也是解锁更低 CP 档 / 更长上下文的容量项。
 前提：容器内 `pip install --no-deps "nvidia-cudnn-frontend[cutedsl]>=1.24.0"`
 （全量安装会遮蔽容器 CUDA）。先 100 iter 与未开启时做 loss 对照再长跑：
 
@@ -307,7 +351,7 @@ SM90（Hopper）。128K 下 attention/indexer 是计算大头，收益显著。
 STEP=128k GBS=16 EXTRA_OVERRIDES="model.apply_dsa_kernel_fusion=true" sbatch scripts/slurm_stage_b_128k.sh
 ```
 
-### 4. 通信重叠
+### 6. 通信重叠
 
 ```bash
 EXTRA_OVERRIDES="comm_overlap.overlap_moe_expert_parallel_comm=true"
@@ -316,7 +360,7 @@ EXTRA_OVERRIDES="comm_overlap.overlap_moe_expert_parallel_comm=true"
 EP all-to-all 与计算重叠；与 ddp 的 `overlap_grad_reduce/overlap_param_gather`
 （Adam recipe 路线默认已开）叠加使用。逐项开、逐项对比。
 
-### 5. 数据是混合长度 → Dynamic CP
+### 7. 数据是混合长度 → Dynamic CP
 
 静态 CP32 会把 4K 的短样本也切成 32 份跑，纯浪费。若 SFT 数据长短混合，
 改用官方 Dynamic CP（`examples/training_features/long_context/`）：
@@ -327,7 +371,7 @@ EXTRA_OVERRIDES="model.dynamic_context_parallel=true model.sequence_packing_sche
 
 短样本自动 local_cp_size=1，只有真 128K 样本才占满 CP 组。
 
-### 6. 网络自查
+### 8. 网络自查
 
 16 节点 `all_gather_perf`/`reduce_scatter_perf` 的 busbw 应接近 RoCE 线速；
 训练日志绝不能出现 `NET/Socket`。带宽差一个量级时先修网络再谈调优。
